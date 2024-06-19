@@ -203,37 +203,6 @@ def visualize_suite(rendering, rays):
       None,
       curve_fn=lambda x: jnp.log(x + jnp.finfo(jnp.float32).eps))
 
-  dist = rendering['ray_sdist']
-  dist_range = (0, 1)
-  weights = rendering['ray_weights']
-  rgbs = [jnp.clip(r, 0, 1) for r in rendering['ray_rgbs']]
-
-  vis_ray_colors, _ = visualize_rays(dist, dist_range, weights, rgbs)
-
-  sqrt_weights = [jnp.sqrt(w) for w in weights]
-  sqrt_ray_weights, ray_alpha = visualize_rays(
-      dist,
-      dist_range,
-      [jnp.ones_like(lw) for lw in sqrt_weights],
-      [lw[..., None] for lw in sqrt_weights],
-      bg_color=0,
-  )
-  sqrt_ray_weights = sqrt_ray_weights[..., 0]
-
-  null_color = jnp.array([1., 0., 0.])
-  vis_ray_weights = jnp.where(
-      ray_alpha[:, :, None] == 0,
-      null_color[None, None],
-      visualize_cmap(
-          sqrt_ray_weights,
-          jnp.ones_like(sqrt_ray_weights),
-          cm.get_cmap('gray'),
-          lo=0,
-          hi=1,
-          matte_background=False,
-      ),
-  )
-
   vis = {
       'color': rgb,
       'acc': acc,
@@ -242,9 +211,41 @@ def visualize_suite(rendering, rays):
       'depth_median': vis_depth_median,
       'depth_triplet': vis_depth_triplet,
       'coords_mod': visualize_coord_mod(coords, acc),
-      'ray_colors': vis_ray_colors,
-      'ray_weights': vis_ray_weights,
   }
+
+  if 'ray_sdist' in rendering:
+    dist = rendering['ray_sdist']
+    dist_range = (0, 1)
+    weights = rendering['ray_weights']
+    rgbs = [jnp.clip(r, 0, 1) for r in rendering['ray_rgbs']]
+
+    vis_ray_colors, _ = visualize_rays(dist, dist_range, weights, rgbs)
+    vis['ray_colors'] = vis_ray_colors
+
+    sqrt_weights = [jnp.sqrt(w) for w in weights]
+    sqrt_ray_weights, ray_alpha = visualize_rays(
+        dist,
+        dist_range,
+        [jnp.ones_like(lw) for lw in sqrt_weights],
+        [lw[..., None] for lw in sqrt_weights],
+        bg_color=0,
+    )
+    sqrt_ray_weights = sqrt_ray_weights[..., 0]
+
+    null_color = jnp.array([1., 0., 0.])
+    vis_ray_weights = jnp.where(
+        ray_alpha[:, :, None] == 0,
+        null_color[None, None],
+        visualize_cmap(
+            sqrt_ray_weights,
+            jnp.ones_like(sqrt_ray_weights),
+            cm.get_cmap('gray'),
+            lo=0,
+            hi=1,
+            matte_background=False,
+        ),
+    )
+    vis['ray_weights'] = vis_ray_weights
 
   if 'rgb_cc' in rendering:
     vis['color_corrected'] = rendering['rgb_cc']

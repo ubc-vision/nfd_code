@@ -59,6 +59,7 @@ class Config:
   # If true, use all input images for training.
   llff_use_all_images_for_training: bool = False
   use_tiffs: bool = False  # If True, use 32-bit TIFFs. Used only by Blender.
+  use_exrs: bool = False  # If True, use 32-bit EXRs. Used only by Blender.
   compute_disp_metrics: bool = False  # If True, load and compute disparity MSE.
   compute_normal_metrics: bool = False  # If True, load and compute normal MAE.
   gc_every: int = 10000  # The number of steps between garbage collections.
@@ -66,6 +67,7 @@ class Config:
   randomized: bool = True  # Use randomized stratified sampling.
   near: float = 2.  # Near plane distance.
   far: float = 6.  # Far plane distance.
+  global_scale: float = 1.  # Global scale factor for 360 and blender scenes.
   checkpoint_dir: Optional[str] = None  # Where to log checkpoints.
   render_dir: Optional[str] = None  # Output rendering directory.
   data_dir: Optional[str] = None  # Input data directory.
@@ -76,6 +78,7 @@ class Config:
   vis_num_rays: int = 16  # The number of rays to visualize.
   # Decimate images for tensorboard (ie, x[::d, ::d]) to conserve memory usage.
   vis_decimate: int = 0
+  use_light_field: bool = False  # If True, use the light field model.
 
   # Only used by train.py:
   max_steps: int = 250000  # The number of optimization steps.
@@ -104,6 +107,26 @@ class Config:
   #   }
   # Any model parameter that isn't specified gets a mult of 0. See the
   # train_weight_l2_* parameters in TensorBoard to know what can be regularized.
+
+  # Specific to MLE training:
+  mle_training: bool = False  # If True, use MLE loss instead of reconstruction.
+  mle_lossmult: bool = False  # If True, lossmult in MLE training.
+  min_intensity: float = 0.  # Minimum intensity for ground truth pixel values.
+  linear_data_loss: bool = False  # If True, convert gamma->linear for the loss.
+  use_filtering: bool = False  # If True, apply perturbations for filtering.
+  max_defocus: float = 1e-7  # Maximum defocus filter factor for beams.
+  min_defocus: float = 1e-7  # Minimum defocus filter factor for beams.
+  max_aperture: float = 1e-7  # Maximum beam filter radius at the sensor.
+  min_aperture: float = 1e-7  # Minimum beam filter radius at the sensor.
+  max_focus_dist: float = 0.  # Maximum distance to the focal point.
+  min_focus_dist: float = 0.  # Minimum distance to the focal point.
+  use_motion_blur: bool = False  # If True, include motion blur perturbations.
+  max_motion_angle: float = 1e-7  # Maximum motion angle for beams.
+  min_motion_angle: float = 1e-7  # Minimum motion angle for beams.
+  max_motion_translation: float = 1e-7  # Maximum motion translation for beams.
+  min_motion_translation: float = 1e-7  # Minimum motion translation for beams.
+  max_pivot_dist: float = 0.  # Maximum pivot distance for beams.
+  min_pivot_dist: float = 0.  # Minimum pivot distance for beams.
 
   lr_init: float = 0.002  # The initial learning rate.
   lr_final: float = 0.00002  # The final learning rate.

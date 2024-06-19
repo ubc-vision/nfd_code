@@ -41,6 +41,30 @@ def lift_gaussian(d, t_mean, t_var, r_var, diag):
     return mean, cov
 
 
+def beam_section_to_gaussian(d, t0, t1, r, w, diag):
+  """Approximate a beam section as a Gaussian distribution (mean+cov).
+
+  Assumes the ray is originating from the origin, r is the standard deviation
+  of the slope distribution, and w is the standard deviation of the y-intercept.
+  Doesn't assume `d` is normalized.
+
+  Args:
+    d: jnp.float32 3-vector, the axis of the beam
+    t0: float, the starting distance of the beam.
+    t1: float, the ending distance of the beam.
+    r: float, the standard deviation of the slope distribution.
+    w: float, the standard deviation of the y-intercept distribution.
+    diag: boolean, whether or the Gaussian will be diagonal or full-covariance.
+
+  Returns:
+    a Gaussian (mean and covariance).
+  """
+  t_mean = (t0 + t1) / 2
+  t_var = (t1 - t0)**2 / 12
+  r_var = r**2 * (t0**2 + t1**2 + t0 * t1) / 3 + w**2
+  return lift_gaussian(d, t_mean, t_var, r_var, diag)
+
+
 def conical_frustum_to_gaussian(d, t0, t1, base_radius, diag, stable=True):
   """Approximate a conical frustum as a Gaussian distribution (mean+cov).
 
@@ -100,7 +124,19 @@ def cylinder_to_gaussian(d, t0, t1, radius, diag):
   return lift_gaussian(d, t_mean, t_var, r_var, diag)
 
 
-def cast_rays(tdist, origins, directions, radii, ray_shape, diag=True):
+def cast_rays(tdist,
+              origins,
+              directions,
+              radii,
+              ray_shape,
+              focus_dists=0.0,
+              waists=0.0,
+              rotation_axes=0.0,
+              rotation_stddev=0.0,
+              translation_direction=0.0,
+              translation_stddev=0.0,
+              pivot_dist=0.0,
+              diag=True):
   """Cast rays (cone- or cylinder-shaped) and featurize sections of it.
 
   Args:
@@ -109,21 +145,45 @@ def cast_rays(tdist, origins, directions, radii, ray_shape, diag=True):
     directions: float array, the ray direction vectors.
     radii: float array, the radii (base radii for cones) of the rays.
     ray_shape: string, the shape of the ray, must be 'cone' or 'cylinder'.
+    focus_dists: float array, distances at which the CoCs are zero.
+    waists: float array, the standard deviation of the CoC distribution.
     diag: boolean, whether or not the covariance matrices should be diagonal.
 
   Returns:
     a tuple of arrays of means and covariances.
   """
-  t0 = tdist[..., :-1]
-  t1 = tdist[..., 1:]
+  tdist_b = tdist - focus_dists
+  t0 = tdist_b[..., :-1]
+  t1 = tdist_b[..., 1:]
   if ray_shape == 'cone':
     gaussian_fn = conical_frustum_to_gaussian
   elif ray_shape == 'cylinder':
     gaussian_fn = cylinder_to_gaussian
+  elif ray_shape == 'beam':
+    def gaussian_fn(d, t0, t1, r, diag):
+      return beam_section_to_gaussian(d, t0, t1, r, waists, diag)
   else:
     raise ValueError('ray_shape must be \'cone\' or \'cylinder\'')
   means, covs = gaussian_fn(directions, t0, t1, radii, diag)
   means = means + origins[..., None, :]
+
+  means += directions[..., None, :] * focus_dists[..., None]
+
+  t_mean = (tdist[..., :-1] + tdist[..., 1:]) / 2
+  t_mean -= pivot_dist
+
+  rot_tangent = jnp.cross(rotation_axes, directions)[..., None, :]
+  rot_tangent *= t_mean[..., None] * rotation_stddev[..., None, :]
+  rot_cov = rot_tangent[..., None] * rot_tangent[..., None, :]
+
+  covs += rot_cov
+
+  trans_tangent = translation_direction * translation_stddev
+  trans_tangent = trans_tangent[..., None, :]
+  trans_cov = trans_tangent[..., None] * trans_tangent[..., None, :]
+
+  covs += trans_cov
+
   return means, covs
 
 

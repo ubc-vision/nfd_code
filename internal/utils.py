@@ -55,6 +55,13 @@ class Rays:
   cam_idx: _Array
   exposure_idx: Optional[_Array] = None
   exposure_values: Optional[_Array] = None
+  focus_dists: Optional[_Array] = None
+  waists: Optional[_Array] = None
+  rotation_axes: Optional[_Array] = None
+  rotation_stddev: Optional[_Array] = None
+  translation_direction: Optional[_Array] = None
+  translation_stddev: Optional[_Array] = None
+  pivot_dist: Optional[_Array] = None
 
 
 # Dummy Rays object that can be used to initialize NeRF model.
@@ -87,6 +94,7 @@ class Batch:
   disps: Optional[_Array] = None
   normals: Optional[_Array] = None
   alphas: Optional[_Array] = None
+  mean: Optional[_Array] = None
 
 
 class DataSplit(enum.Enum):

@@ -188,7 +188,8 @@ def generate_spiral_path(poses: np.ndarray,
   return render_poses
 
 
-def transform_poses_pca(poses: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def transform_poses_pca(poses: np.ndarray,
+                        scale=1.0) -> Tuple[np.ndarray, np.ndarray]:
   """Transforms poses so principal components lie on XYZ axes.
 
   Args:
@@ -220,7 +221,7 @@ def transform_poses_pca(poses: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     transform = np.diag(np.array([1, -1, -1, 1])) @ transform
 
   # Just make sure it's it in the [-1, 1]^3 cube
-  scale_factor = 1. / np.max(np.abs(poses_recentered[:, :3, 3]))
+  scale_factor = scale / np.max(np.abs(poses_recentered[:, :3, 3]))
   poses_recentered[:, :3, 3] *= scale_factor
   transform = np.diag(np.array([scale_factor] * 3 + [1])) @ transform
 
@@ -761,3 +762,28 @@ def cast_spherical_rays(camtoworld: _Array,
   }
 
   return utils.Rays(*ray_args, **ray_kwargs)
+
+
+def pinhole_rays_to_beam_rays(rays: utils.Rays, focus_dists: _Array,
+                              apertures: _Array) -> utils.Rays:
+  """Constructs beam rays from pinhole rays and lens parameters."""
+  
+  # Compute least circle of confusion (lCoC) for each ray.
+  lcocs = focus_dists * rays.radii
+
+  # Does each beam converge or diverge from the lens?
+  converging_mask = lcocs < apertures
+
+  waists = converging_mask * lcocs + ~converging_mask * apertures
+  new_focus_dists = converging_mask * focus_dists
+
+  # Compute slopes for each ray.
+  converging_radii = jnp.abs(apertures - lcocs) / focus_dists
+  diverging_radii = lcocs / focus_dists
+  radii = converging_mask * converging_radii + ~converging_mask * diverging_radii
+
+  return rays.replace(
+      radii=radii,
+      focus_dists=new_focus_dists,
+      waists=waists,
+  )

@@ -70,6 +70,9 @@ class Model(nn.Module):
   resample_padding: float = 0.0  # Dirichlet/alpha "padding" on the histogram.
   use_gpu_resampling: bool = False  # Use gather ops for faster GPU resampling.
   opaque_background: bool = False  # If true, make the background opaque.
+  linear_accumulation: bool = False  # If true, use linear RGB in accumulation.
+  min_prop_waist: float = 0.0
+  use_beam_width_bias: bool = False
 
   @nn.compact
   def __call__(
@@ -170,6 +173,16 @@ class Model(nn.Module):
         sdist = sdist[..., 1:-1]
         weights = weights[..., 1:-1]
 
+      if self.use_beam_width_bias and rays.focus_dists is not None and i_level == 0:
+        s = jnp.linspace(0.0, 1.0, self.num_prop_samples + 1)
+        sdist = sdist[..., 0:1] + (sdist[..., 1:2] - sdist[..., 0:1]) * s
+        tdist = s_to_t(sdist)
+        t = (tdist[..., 1:] + tdist[..., :-1]) / 2.0
+
+        std = jnp.sqrt(rays.radii**2 * (t - rays.focus_dists)**2 + rays.waists**2)
+        weights = t / (std + 1e-7)
+        weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+
       # Optionally anneal the weights as a function of training iteration.
       if self.anneal_slope > 0:
         # Schlick's bias function, see https://arxiv.org/abs/2010.09714
@@ -203,6 +216,45 @@ class Model(nn.Module):
       # Convert normalized distances to metric distances.
       tdist = s_to_t(sdist)
 
+      if rays.focus_dists is None:
+        focus_dists = jnp.zeros_like(rays.radii)
+      else:
+        focus_dists = rays.focus_dists
+
+      if rays.waists is None:
+        waists = jnp.zeros_like(rays.radii)
+      else:
+        waists = rays.waists
+
+      if rays.rotation_axes is None:
+        rotation_axes = jnp.ones_like(rays.origins)
+        rotation_axes /= jnp.linalg.norm(rotation_axes, axis=-1, keepdims=True)
+      else:
+        rotation_axes = rays.rotation_axes
+
+      if rays.rotation_stddev is None:
+        rotation_stddev = jnp.zeros_like(rays.radii)
+      else:
+        rotation_stddev = rays.rotation_stddev
+
+      if rays.translation_direction is None:
+        translation_direction = jnp.zeros_like(rays.origins)
+      else:
+        translation_direction = rays.translation_direction
+
+      if rays.translation_stddev is None:
+        translation_stddev = jnp.zeros_like(rays.radii)
+      else:
+        translation_stddev = rays.translation_stddev
+
+      if rays.pivot_dist is None:
+        pivot_dist = jnp.zeros_like(rays.radii)
+      else:
+        pivot_dist = rays.pivot_dist
+
+      if is_prop:
+        waists = jnp.clip(waists, self.min_prop_waist, 1e10)
+
       # Cast our rays, by turning our distance intervals into Gaussians.
       gaussians = render.cast_rays(
           tdist,
@@ -210,6 +262,13 @@ class Model(nn.Module):
           rays.directions,
           rays.radii,
           self.ray_shape,
+          focus_dists=focus_dists,
+          waists=waists,
+          rotation_axes=rotation_axes,
+          rotation_stddev=rotation_stddev,
+          translation_direction=translation_direction,
+          translation_stddev=translation_stddev,
+          pivot_dist=pivot_dist,
           diag=False)
 
       if self.disable_integration:
@@ -227,6 +286,7 @@ class Model(nn.Module):
           imageplane=rays.imageplane,
           glo_vec=None if is_prop else glo_vec,
           exposure=rays.exposure_values,
+          radii=rays.radii[..., None, :],
       )
 
       # Get the weights used by volumetric rendering (and our other losses).
@@ -309,6 +369,118 @@ class Model(nn.Module):
       for i in range(len(avg_rgbs)):
         renderings[i]['ray_rgbs'] = avg_rgbs[i]
 
+    if self.linear_accumulation:
+      for i in range(len(renderings)):
+        renderings[i]['rgb'] = image.linear_to_srgb(
+            renderings[i]['rgb'])
+
+    return renderings, ray_history
+  
+
+@gin.configurable
+class LFModel(nn.Module):
+  """A mip-Nerf360 model containing all MLPs."""
+  config: Any = None  # A Config class, must be set upon construction.
+  num_glo_features: int = 0  # GLO vector length, disabled if 0.
+  num_glo_embeddings: int = 1000  # Upper bound on max number of train images.
+  learned_exposure_scaling: bool = False  # Learned exposure scaling (RawNeRF).
+
+  @nn.compact
+  def __call__(
+      self,
+      rng,
+      rays,
+      train_frac,
+      compute_extras,
+      zero_glo=True,
+  ):
+    """The mip-NeRF Model.
+
+    Args:
+      rng: random number generator (or None for deterministic output).
+      rays: util.Rays, a pytree of ray origins, directions, and viewdirs.
+      train_frac: float in [0, 1], what fraction of training is complete.
+      compute_extras: bool, if True, compute extra quantities besides color.
+      zero_glo: bool, if True, when using GLO pass in vector of zeros.
+
+    Returns:
+      ret: list, [*(rgb, distance, acc)]
+    """
+
+    # Compute plucker coordinates for each ray.
+    d = rays.directions
+    d /= jnp.linalg.norm(d, axis=-1, keepdims=True)
+    m, d = coord.rays_to_plucker(rays.origins, d)
+    ray_coords = jnp.concatenate([m / 10.0, d], axis=-1)
+
+    units = 1536
+    fnet_units = 512
+
+    if rays.radii is None:
+      radii = jnp.zeros_like(rays.origins[..., 0:1])
+    else:
+      radii = rays.radii
+    
+    if rays.focus_dists is None:
+      focus_dists = jnp.zeros_like(rays.origins[..., 0:1])
+    else:
+      focus_dists = rays.focus_dists
+
+    if rays.waists is None:
+      waists = jnp.zeros_like(rays.origins[..., 0:1])
+    else:
+      waists = rays.waists
+
+    depth_samples = jnp.linspace(0.0, 100.0, 128)
+    filter_inputs = jnp.sqrt(radii**2 * (depth_samples - focus_dists)**2 + waists**2)
+    
+    fnet = filter_inputs
+    for i in range(4):
+      fnet = nn.Dense(fnet_units)(fnet)
+      fnet = nn.relu(fnet)
+
+    def bases_init(rng, shape):
+      rng1, rng2 = jax.random.split(rng)
+      freqs = 2**(10.0 * jax.random.uniform(rng1, shape[:-1] + (1,)))
+      dirs = jax.random.normal(rng2, shape)
+      dirs = dirs / jnp.linalg.norm(dirs, axis=-1, keepdims=True)
+      return dirs * freqs
+
+    bases = self.param('bases', bases_init, (512, 6))
+
+    def posenc(x):
+      a = jnp.sum(bases * x[..., None, :], axis=-1)
+      return jnp.concatenate([x, jnp.cos(a), jnp.sin(a)], axis=-1)
+
+    inputs = posenc(ray_coords)
+
+    weights = nn.Dense(inputs.shape[-1])(fnet)
+    weights = nn.sigmoid(weights)
+    inputs = inputs * weights
+
+    net = inputs
+    for i in range(8):
+      if i == 4:
+        net = jnp.concatenate([net, inputs], axis=-1)
+
+      net = nn.Dense(units)(net)
+      net = nn.relu(net)
+
+    net = nn.Dense(3)(net)
+    net = nn.softplus(net)
+
+    renderings = [{
+        'rgb': net,
+        'acc': jnp.ones_like(net[..., 0]),
+        'distance_mean': jnp.zeros_like(net[..., 0]),
+        'distance_median': jnp.zeros_like(net[..., 0]),
+        'distance_percentile_5': jnp.zeros_like(net[..., 0]),
+        'distance_percentile_50': jnp.zeros_like(net[..., 0]),
+        'distance_percentile_95': jnp.zeros_like(net[..., 0]),
+    }]
+
+    ray_history = None
+
     return renderings, ray_history
 
 
@@ -327,7 +499,10 @@ def construct_model(rng, rays, config):
   # Grab just 10 rays, to minimize memory overhead during construction.
   ray = jax.tree_util.tree_map(lambda x: jnp.reshape(x, [-1, x.shape[-1]])[:10],
                                rays)
-  model = Model(config=config)
+  if config.use_light_field:
+    model = LFModel(config=config)
+  else:
+    model = Model(config=config)
   init_variables = model.init(
       rng,  # The RNG used by flax to initialize random weights.
       rng=None,  # The RNG used by sampling within the model.
@@ -360,6 +535,8 @@ class MLP(nn.Module):
   # Roughness activation function.
   roughness_activation: Callable[..., Any] = nn.softplus
   roughness_bias: float = -1.  # Shift added to raw roughness pre-activation.
+  # If True, increase roughness based on beam radii.
+  use_radii_in_roughness: bool = False
   use_diffuse_color: bool = False  # If True, predict diffuse & specular colors.
   use_specular_tint: bool = False  # If True, predict tint.
   use_n_dot_v: bool = False  # If True, feed dot(n * viewdir) to 2nd MLP.
@@ -406,7 +583,8 @@ class MLP(nn.Module):
                viewdirs=None,
                imageplane=None,
                glo_vec=None,
-               exposure=None):
+               exposure=None,
+               radii=None):
     """Evaluate the MLP.
 
     Args:
@@ -424,6 +602,7 @@ class MLP(nn.Module):
         learned vignette mapping.
       glo_vec: [..., num_glo_features], The GLO vector for each ray.
       exposure: [..., 1], exposure value (shutter_speed * ISO) for each ray.
+      radii: [..., n, 1] radii of the beams/conic sections.
 
     Returns:
       rgb: jnp.ndarray(float32), with a shape of [..., num_rgb_channels].
@@ -521,6 +700,11 @@ class MLP(nn.Module):
           raw_roughness = dense_layer(1)(x)
           roughness = (
               self.roughness_activation(raw_roughness + self.roughness_bias))
+        else:
+          roughness = jnp.zeros_like(x[..., :1])
+
+        if self.use_radii_in_roughness:
+          roughness += radii**2
 
         # Output of the first part of MLP.
         if self.bottleneck_width > 0:
@@ -547,11 +731,9 @@ class MLP(nn.Module):
           dir_enc = self.dir_enc_fn(refdirs, roughness)
         else:
           # Encode view directions.
-          dir_enc = self.dir_enc_fn(viewdirs, roughness)
+          dir_enc = self.dir_enc_fn(viewdirs[..., None, :], roughness)
 
-          dir_enc = jnp.broadcast_to(
-              dir_enc[..., None, :],
-              bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+        dir_enc += 0.0 * x[0][..., :1]
 
         # Append view (or reflection) direction encoding to bottleneck vector.
         x.append(dir_enc)

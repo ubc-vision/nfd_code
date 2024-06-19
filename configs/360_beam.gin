@@ -1,0 +1,38 @@
+Config.dataset_loader = 'llff'
+Config.near = 0.2
+Config.far = 1e6
+Config.factor = 4
+
+Config.mle_training = True
+Config.lr_init = 0.001
+Config.linear_data_loss = True
+Model.linear_accumulation = True
+Model.ray_shape = 'beam'
+
+NerfMLP.use_directional_enc = True
+NerfMLP.use_radii_in_roughness = True
+
+Config.use_filtering = True
+
+Config.max_defocus = 0.1
+Config.min_defocus = 0.001
+Config.max_aperture = 0.025
+Config.min_aperture = 0.000005
+
+Config.max_focus_dist = 1.5
+Config.min_focus_dist = 0.5
+
+Model.raydist_fn = @jnp.reciprocal
+Model.opaque_background = True
+
+PropMLP.warp_fn = @coord.contract
+PropMLP.net_depth = 4
+PropMLP.net_width = 256
+PropMLP.disable_density_normals = True
+PropMLP.disable_rgb = True
+
+NerfMLP.warp_fn = @coord.contract
+NerfMLP.net_depth = 8
+NerfMLP.net_width = 1024
+NerfMLP.disable_density_normals = True
+

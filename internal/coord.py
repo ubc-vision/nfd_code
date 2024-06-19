@@ -145,3 +145,8 @@ def pos_enc(x, min_deg, max_deg, append_identity=True):
     return jnp.concatenate([x] + [four_feat], axis=-1)
   else:
     return four_feat
+
+def rays_to_plucker(origins, directions):
+  """Convert rays to Plucker coordinates."""
+  m = jnp.cross(origins, directions)
+  return m, directions

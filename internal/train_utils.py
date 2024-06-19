@@ -86,23 +86,47 @@ def compute_data_loss(batch, renderings, rays, config):
     denom = lossmult.sum()
     stats['mses'].append((lossmult * resid_sq).sum() / denom)
 
-    if config.data_loss_type == 'mse':
-      # Mean-squared error (L2) loss.
-      data_loss = resid_sq
-    elif config.data_loss_type == 'charb':
-      # Charbonnier loss.
-      data_loss = jnp.sqrt(resid_sq + config.charb_padding**2)
-    elif config.data_loss_type == 'rawnerf':
-      # Clip raw values against 1 to match sensor overexposure behavior.
-      rgb_render_clip = jnp.minimum(1., rendering['rgb'])
-      resid_sq_clip = (rgb_render_clip - batch.rgb[..., :3])**2
-      # Scale by gradient of log tonemapping curve.
-      scaling_grad = 1. / (1e-3 + jax.lax.stop_gradient(rgb_render_clip))
-      # Reweighted L2 loss.
-      data_loss = resid_sq_clip * scaling_grad**2
+    if config.mle_training:
+      EPS = 1e-6
+
+      gt_rgb = batch.rgb[..., :3]
+      if config.linear_data_loss:
+        gt_rgb = image.srgb_to_linear(gt_rgb)
+
+      rgb_render = rendering['rgb']
+      if config.linear_data_loss:
+        rgb_render = image.srgb_to_linear(rgb_render)
+
+      if config.mle_lossmult:
+        rgb_render = rgb_render * lossmult
+        gt_rgb = gt_rgb * lossmult
+
+      rgb_render = jnp.clip(rgb_render, EPS, None)
+
+      data_loss = jnp.mean(-jnp.log(rgb_render) * gt_rgb) / jnp.mean(gt_rgb)
+      data_loss += jnp.log(jnp.mean(rgb_render))
+      data_loss += (jnp.mean(rgb_render) - jnp.mean(gt_rgb))**2
+
+      data_losses.append(data_loss)
+
     else:
-      assert False
-    data_losses.append((lossmult * data_loss).sum() / denom)
+      if config.data_loss_type == 'mse':
+        # Mean-squared error (L2) loss.
+        data_loss = resid_sq
+      elif config.data_loss_type == 'charb':
+        # Charbonnier loss.
+        data_loss = jnp.sqrt(resid_sq + config.charb_padding**2)
+      elif config.data_loss_type == 'rawnerf':
+        # Clip raw values against 1 to match sensor overexposure behavior.
+        rgb_render_clip = jnp.minimum(1., rendering['rgb'])
+        resid_sq_clip = (rgb_render_clip - batch.rgb[..., :3])**2
+        # Scale by gradient of log tonemapping curve.
+        scaling_grad = 1. / (1e-3 + jax.lax.stop_gradient(rgb_render_clip))
+        # Reweighted L2 loss.
+        data_loss = resid_sq_clip * scaling_grad**2
+      else:
+        assert False
+      data_losses.append((lossmult * data_loss).sum() / denom)
 
     if config.compute_disp_metrics:
       # Using mean to compute disparity, but other distance statistics can

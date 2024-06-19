@@ -32,6 +32,8 @@ from internal import utils
 import jax
 import numpy as np
 from PIL import Image
+import OpenEXR
+import Imath
 
 # This is ugly, but it works.
 import sys
@@ -259,6 +261,7 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
                        f'per-process batch size {self._batch_size}')
     self._batching = utils.BatchingMethod(config.batching)
     self._use_tiffs = config.use_tiffs
+    self._use_exrs = config.use_exrs
     self._load_disps = config.compute_disp_metrics
     self._load_normals = config.compute_normal_metrics
     self._test_camera_idx = 0
@@ -282,6 +285,21 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     self.camtype = camera_utils.ProjectionType.PERSPECTIVE
     self.exposures = None
     self.render_exposures = None
+    # self.importance_sample = config.mle_training
+    self.use_filtering = config.use_filtering
+    self.max_defocus = config.max_defocus
+    self.min_defocus = config.min_defocus
+    self.max_aperture = config.max_aperture
+    self.min_aperture = config.min_aperture
+    self.max_focus_dist = config.max_focus_dist
+    self.min_focus_dist = config.min_focus_dist
+    self.use_motion_blur = config.use_motion_blur
+    self.max_motion_angle = config.max_motion_angle
+    self.min_motion_angle = config.min_motion_angle
+    self.max_motion_translation = config.max_motion_translation
+    self.min_motion_translation = config.min_motion_translation
+    self.max_pivot_dist = config.max_pivot_dist
+    self.min_pivot_dist = config.min_pivot_dist
 
     # Providing type comments for these attributes, they must be correctly
     # initialized by _load_renderings() (see docstring) in any subclass.
@@ -293,6 +311,8 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
 
     # Load data from disk using provided config parameters.
     self._load_renderings(config)
+
+    self.image_means = np.mean(self.images, axis=(1, 2, 3))
 
     if self.render_path:
       if config.render_path_file is not None:
@@ -431,6 +451,10 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     if self._cast_rays_in_train_step and self.split == utils.DataSplit.TRAIN:
       # Fast path, defer ray computation to the training loop (on device).
       rays = pixels
+
+      if self.use_filtering:
+        raise NotImplementedError(
+            'Filtering not implemented for cast_rays_in_train_step')
     else:
       # Slow path, do ray computation using numpy (on CPU).
       rays = camera_utils.cast_ray_batch(
@@ -446,6 +470,12 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     if self._load_normals:
       batch['normals'] = self.normal_images[cam_idx, pix_y_int, pix_x_int]
       batch['alphas'] = self.alphas[cam_idx, pix_y_int, pix_x_int]
+
+    if self._batching == utils.BatchingMethod.ALL_IMAGES:
+      batch['mean'] = np.mean(self.image_means)
+    else:
+      batch['mean'] = self.image_means[int(cam_idx)]
+
     return utils.Batch(**batch)
 
   def _next_train(self) -> utils.Batch:
@@ -480,8 +510,110 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     else:
       lossmult = None
 
-    return self._make_ray_batch(pix_x_int, pix_y_int, cam_idx,
-                                lossmult=lossmult)
+    batch = self._make_ray_batch(pix_x_int, pix_y_int, cam_idx,
+                                  lossmult=lossmult)
+
+    if self.use_filtering:
+      rays = batch.rays
+      
+      def log_uniform(minval, maxval, shape):
+        u = np.random.uniform(size=shape)
+        return np.exp(np.log(minval) * (1 - u) + np.log(maxval) * u)
+      
+      def ortho_noise(v):
+        x = np.random.normal(size=v.shape)
+        o = np.sum(x * v, axis=-1, keepdims=True) * v
+        return x - o / np.sum(v**2, axis=-1, keepdims=True)
+
+      if self.use_motion_blur:
+        rotation_axes = np.random.normal(size=rays.directions.shape)
+        rotation_axes /= np.linalg.norm(rotation_axes, axis=-1, keepdims=True)
+        rotation_stddev = log_uniform(
+            self.min_motion_angle, self.max_motion_angle, rays.directions.shape[:-1])
+        rotation_angles = rotation_stddev * np.random.normal(size=rays.directions.shape[:-1])
+        rotation_angles = rotation_angles[..., None]
+        
+        sa, ca = np.sin(rotation_angles), np.cos(rotation_angles)
+        dp = np.sum(rays.directions * rotation_axes, axis=-1, keepdims=True)
+        cp = np.cross(rays.directions, rotation_axes)
+        rotated_dir = ca * rays.directions + sa * cp + (1 - ca) * dp * rotation_axes
+        rotated_viewdir = rotated_dir / np.linalg.norm(
+            rotated_dir, axis=-1, keepdims=True)
+
+        u = np.random.uniform(size=rays.radii.shape)
+        pivot_dist = self.min_pivot_dist + u * (
+          self.max_pivot_dist - self.min_pivot_dist)
+        pivot_point = rays.origins + pivot_dist * rays.directions
+        new_origins = pivot_point - pivot_dist * rotated_dir
+
+        trans_stddev = log_uniform(
+            self.min_motion_translation, self.max_motion_translation, rays.directions.shape[:-1])
+        translation = trans_stddev[..., None] * np.random.normal(size=rays.directions.shape)
+        new_origins += translation
+        translation_direction = translation / np.linalg.norm(
+            translation, axis=-1, keepdims=True)
+
+        rays = rays.replace(
+          origins=new_origins,
+          directions=rotated_dir,
+          viewdirs=rotated_viewdir,
+          rotation_axes=rotation_axes,
+          rotation_stddev=rotation_stddev[..., None],
+          translation_direction=translation_direction,
+          translation_stddev=trans_stddev[..., None],
+          pivot_dist=pivot_dist)
+      
+      u = np.random.uniform(size=rays.radii.shape)
+      focus_lengths = self.min_focus_dist + u * (
+          self.max_focus_dist - self.min_focus_dist)
+      
+      waists = focus_lengths * rays.radii
+      waists *= 1 + log_uniform(
+          self.min_defocus, self.max_defocus, waists.shape)
+
+      apertures = log_uniform(
+          self.min_aperture, self.max_aperture, waists.shape)
+      
+      sqr_slopes = (waists**2 - apertures**2) / focus_lengths**2
+
+      focus_dists = np.where(sqr_slopes > 0, 0.0, focus_lengths)
+      radii = np.sqrt(np.abs(sqr_slopes))  # stddev of the slope distribution
+
+      focii = rays.origins + focus_dists * rays.directions
+
+      defocus_noise = ortho_noise(rays.directions) * waists
+      fulcra = focii + defocus_noise
+
+      norms = np.linalg.norm(rays.directions, axis=-1, keepdims=True)
+      direction_noise = ortho_noise(rays.directions) * radii * norms
+      new_directions = rays.directions + direction_noise
+      new_viewdirs = new_directions / np.linalg.norm(
+          new_directions, axis=-1, keepdims=True)
+
+      new_origins = fulcra - focus_dists * new_directions
+
+      filter_frac = 0.25
+      u = np.random.uniform(size=rays.radii.shape)
+      mask = u < filter_frac
+
+      new_origins = np.where(mask, new_origins, rays.origins)
+      new_directions = np.where(mask, new_directions, rays.directions)
+      new_viewdirs = np.where(mask, new_viewdirs, rays.viewdirs)
+      radii = np.where(mask, radii, rays.radii)
+      focus_dists = np.where(mask, focus_dists, np.zeros_like(focus_dists))
+      waists = np.where(mask, waists, np.zeros_like(waists))
+
+      rays = rays.replace(
+          origins=new_origins,
+          directions=new_directions,
+          viewdirs=new_viewdirs,
+          radii=radii,
+          focus_dists=focus_dists,
+          waists=waists)
+
+      batch = batch.replace(rays=rays)
+
+    return batch
 
   def generate_ray_batch(self, cam_idx: int) -> utils.Batch:
     """Generate ray batch for a specified camera in the dataset."""
@@ -502,6 +634,38 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     cam_idx = self._test_camera_idx
     self._test_camera_idx = (self._test_camera_idx + 1) % self._n_examples
     return self.generate_ray_batch(cam_idx)
+
+
+def load_exr(file_path):
+  exr_file = OpenEXR.InputFile(file_path)
+
+  # Get the header information
+  header = exr_file.header()
+
+  # Get the image size
+  width = header['dataWindow'].max.x - header['dataWindow'].min.x + 1
+  height = header['dataWindow'].max.y - header['dataWindow'].min.y + 1
+
+  # Specify the data format (float for 32-bit)
+  channel_format = Imath.PixelType(Imath.PixelType.FLOAT)
+
+  # Read the channels from the EXR file
+  r_channel = exr_file.channel('R', channel_format)
+  g_channel = exr_file.channel('G', channel_format)
+  b_channel = exr_file.channel('B', channel_format)
+
+  # Create NumPy arrays to store the channel data
+  r_data = np.frombuffer(r_channel, dtype=np.float32)
+  g_data = np.frombuffer(g_channel, dtype=np.float32)
+  b_data = np.frombuffer(b_channel, dtype=np.float32)
+
+  # Reshape the data to match the image size
+  r_data = r_data.reshape((height, width))
+  g_data = g_data.reshape((height, width))
+  b_data = b_data.reshape((height, width))
+
+  # Stack the channels to create the RGB image
+  return np.stack((r_data, g_data, b_data), axis=-1)
 
 
 class Blender(Dataset):
@@ -531,6 +695,10 @@ class Blender(Dataset):
         channels = [get_img(f'_{ch}.tiff') for ch in ['R', 'G', 'B', 'A']]
         # Convert image to sRGB color space.
         image = lib_image.linear_to_srgb(np.stack(channels, axis=-1))
+      elif self._use_exrs:
+        image = load_exr(f'{fprefix}.exr')
+
+        image = np.concatenate([image, np.ones_like(image[..., :1])], axis=-1)
       else:
         image = get_img('.png') / 255.
       images.append(image)
@@ -542,7 +710,10 @@ class Blender(Dataset):
         normal_image = get_img('_normal.png')[..., :3] * 2. / 255. - 1.
         normal_images.append(normal_image)
 
-      cams.append(np.array(frame['transform_matrix'], dtype=np.float32))
+      t = np.array(frame['transform_matrix'], dtype=np.float32)
+      t[:3, 3] *= config.global_scale
+
+      cams.append(t)
 
     self.images = np.stack(images, axis=0)
     if self._load_disps:
@@ -667,7 +838,7 @@ class LLFF(Dataset):
           poses, bounds, n_frames=config.render_path_frames)
     else:
       # Rotate/scale poses to align ground with xy plane and fit to unit cube.
-      poses, transform = camera_utils.transform_poses_pca(poses)
+      poses, transform = camera_utils.transform_poses_pca(poses, config.global_scale)
       self.colmap_to_world_transform = transform
       if config.render_spline_keyframes is not None:
         rets = camera_utils.create_render_spline_path(config, image_names,
